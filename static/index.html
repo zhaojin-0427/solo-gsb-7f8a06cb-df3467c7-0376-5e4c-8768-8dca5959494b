@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>本地地块裁切工具</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>本地地块裁切工具</h1>
+    <p class="subtitle">
+      坐标按<strong>平面米制</strong>解释 · 合并禁建区后从地块扣除 ·
+      共点共边不扣面积、重叠禁建区只算一次 ·
+      支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）
+    </p>
+  </header>
+
+  <main class="layout">
+    <section class="panel input-panel">
+      <div class="field">
+        <div class="field-head">
+          <label for="parcel-input">地块 GeoJSON（Polygon / MultiPolygon）</label>
+          <button type="button" class="link-btn" id="load-sample">载入示例</button>
+        </div>
+        <textarea id="parcel-input" spellcheck="false"
+          placeholder='{"type":"Polygon","coordinates":[[[0,0],[100,0],...]]}'></textarea>
+      </div>
+
+      <div class="field">
+        <div class="field-head">
+          <label for="forbidden-input">禁建区 GeoJSON（可多个，可留空）</label>
+          <button type="button" class="link-btn" id="clear-forbidden">清空</button>
+        </div>
+        <textarea id="forbidden-input" spellcheck="false"
+          placeholder='{"type":"FeatureCollection","features":[...]}'></textarea>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="btn-preview" class="btn">预览输入</button>
+        <button type="button" id="btn-clip" class="btn btn-primary">校验并裁切</button>
+        <button type="button" id="btn-relations" class="btn">关系审计</button>
+      </div>
+      <div id="status" class="status" role="status"></div>
+    </section>
+
+    <section class="panel map-panel">
+      <div class="map-toolbar">
+        <div class="layer-toggles">
+          <label class="toggle"><span class="swatch swatch-parcel"></span>地块
+            <input type="checkbox" id="show-parcel" checked /></label>
+          <label class="toggle"><span class="swatch swatch-forbidden"></span>禁建区
+            <input type="checkbox" id="show-forbidden" checked /></label>
+          <label class="toggle"><span class="swatch swatch-result"></span>裁切结果
+            <input type="checkbox" id="show-result" checked /></label>
+        </div>
+        <div class="map-actions">
+          <button type="button" class="btn btn-small" id="btn-zoom-in">＋</button>
+          <button type="button" class="btn btn-small" id="btn-zoom-out">－</button>
+          <button type="button" class="btn btn-small" id="btn-fit">适配视图</button>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="map"></canvas>
+        <div class="map-hint">滚轮缩放 · 拖拽平移</div>
+      </div>
+
+      <div id="stats" class="stats">
+        <div class="stat"><span class="stat-label">地块面积</span><span class="stat-value" id="stat-parcel">—</span></div>
+        <div class="stat"><span class="stat-label">禁建区并集面积</span><span class="stat-value" id="stat-forbidden">—</span></div>
+        <div class="stat"><span class="stat-label">实际扣除面积</span><span class="stat-value" id="stat-removed">—</span></div>
+        <div class="stat stat-highlight"><span class="stat-label">剩余面积</span><span class="stat-value" id="stat-remaining">—</span></div>
+      </div>
+
+      <div class="result-actions">
+        <button type="button" id="btn-download" class="btn btn-primary" disabled>
+          下载结果 GeoJSON
+        </button>
+        <button type="button" id="btn-view-json" class="btn" disabled>查看结果 JSON</button>
+      </div>
+    </section>
+
+    <section class="panel issues-panel" id="issues-panel" hidden>
+      <h2>定位到的问题（<span id="issue-count">0</span>）</h2>
+      <ul id="issue-list"></ul>
+    </section>
+
+    <section class="panel relations-panel" id="relations-panel" hidden>
+      <h2>禁建区关系审计（<span id="relation-count">0</span>）</h2>
+      <p class="relations-hint">
+        逐要素给出禁建区相对地块的关系：
+        <span class="rel-badge rel-disjoint">disjoint 相离</span>
+        <span class="rel-badge rel-touch">touch 共点/共边</span>
+        <span class="rel-badge rel-overlap">overlap 部分重叠</span>
+        <span class="rel-badge rel-within">within 完全位于地块内</span>
+        <span class="rel-badge rel-contains">contains 包含地块</span>
+        <span class="rel-badge rel-equals">equals 完全一致</span>
+        ，点击列表条目可在地图上高亮对应禁建区。
+      </p>
+      <ul id="relation-list"></ul>
+    </section>
+
+    <section class="panel json-panel" id="json-panel" hidden>
+      <h2>结果 GeoJSON</h2>
+      <pre id="json-view"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

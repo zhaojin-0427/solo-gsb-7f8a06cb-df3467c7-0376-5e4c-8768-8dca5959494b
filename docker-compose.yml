@@ -1,0 +1,8 @@
+services:
+  parcel-clipper:
+    build: .
+    image: parcel-clipper:latest
+    container_name: parcel-clipper
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
