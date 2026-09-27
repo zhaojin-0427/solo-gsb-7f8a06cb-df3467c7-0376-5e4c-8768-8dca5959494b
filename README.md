@@ -4,7 +4,8 @@
 （`Polygon` / `MultiPolygon`），先做严格几何校验与错误定位，再把全部禁建区
 **合并（并集）后从地块中扣除**，预览输入与结果、显示剩余面积，并下载结果
 GeoJSON。同时提供**禁建区关系审计**：逐要素判定禁建区相对地块的空间关系
-（相离 / 共点共边 / 部分重叠 / 完全位于地块内 / 包含地块 / 完全一致）。
+（相离 / 共点共边 / 部分重叠 / 完全位于地块内 / 包含地块 / 完全一致），以及
+**等面积分段**：先求可建范围，再按指定方向用平行切线把它等分为 2~12 段。
 
 - 后端：Python 3.11 + FastAPI + Shapely 2（GEOS）
 - 前端：原生 HTML / CSS / JavaScript（Canvas 渲染，**零第三方依赖**）
@@ -64,20 +65,44 @@ FeatureCollection 原始下标作为稳定索引，无效要素跳过、不影�
 结果按 `feature_index` 升序排列。页面「关系审计」列出全部结果并按关系着色，
 点击任一条目即在地图上高亮对应禁建区（其余要素变暗、自动缩放定位）。
 
+### 等面积分段（`POST /api/subdivide`）
+
+在裁切的基础上把**可建范围**（地块 − 禁建区并集）等分为若干面积相等的段：
+
+1. 先按裁切语义计算可建范围；**扣空（可建面积为 0）时报错，不输出分段**。
+2. 方向：从 **+x 轴逆时针旋转 `angle_deg` 度**得到方向向量
+   （`0 ≤ angle_deg < 180`，必须为有限数值）。
+3. 用**垂直于该方向的平行切线**（即投影 `p = x·cosθ + y·sinθ` 的等值线）
+   把可建范围分成 `count` 段（**整数 2~12**），按投影递增编号为段 1…count。
+4. 切线位置由**累计面积反求**：以全部顶点投影为事件点定位目标区间，
+   区间内截面宽度是线性函数、累计面积是二次函数，据此解析求根
+   （数值异常时退化为二分）——**不做等宽切带，也不做栅格近似**。
+5. **累计面积在空隙上恰等于目标时，取空隙的较小投影端**（空隙：可建范围
+   在投影方向上的断开区间，其内累计面积不变）。
+6. 每段面积与目标面积（可建总面积 / count）的偏差不超过
+   **max(1e-6 平方米, 可建总面积 × 1e-8)**。
+7. 每段保留实际的独立面与孔洞（一段可含多个不相连的面，输出为
+   `MultiPolygon`）；各段合并后恰好覆盖可建范围，两两交集面积为 0。
+8. 参数非法（count 非 2~12 整数、angle_deg 非有限数或越界）、输入几何无效、
+   地块要素数不唯一时同样返回 `ok=false` 错误，不输出分段。
+
+页面可填写**数量**与**角度**，分段结果按段着色并标注段号，点击段列表可高亮，
+可下载分段 GeoJSON；**修改任一输入（地块 / 禁建区 / 数量 / 角度）会自动清除旧分段**。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/health、静态页面托管
-│   └── geometry_ops.py    # GeoJSON 解析、错误定位、并集差集裁切、关系审计
+│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/subdivide、/api/health、静态页面托管
+│   └── geometry_ops.py    # GeoJSON 解析、错误定位、并集差集裁切、关系审计、等面积分段
 ├── static/
 │   ├── index.html         # 页面结构
 │   ├── style.css          # 样式
-│   └── app.js             # 输入解析、Canvas 预览/结果渲染、下载（无依赖）
+│   └── app.js             # 输入解析、Canvas 预览/结果/分段渲染、下载（无依赖）
 ├── tests/
-│   ├── test_geometry.py   # 裁切语义与错误定位单元测试
+│   ├── test_geometry.py   # 裁切语义、错误定位与等面积分段单元测试
 │   └── test_api.py        # HTTP 端到端测试
 ├── requirements.txt
 ├── Dockerfile
@@ -138,7 +163,11 @@ python -m tests.test_api
 5. 裁切成功后查看剩余面积与结果图层（绿色），点击「下载结果 GeoJSON」保存；
    扣空时返回空要素集合且不提供下载。
 6. 关系审计后点击关系列表条目可高亮对应禁建区，再点「校验并裁切」可随时回到裁切。
-7. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
+7. 等面积分段：填写「数量」（2~12 的整数）与「角度」（度，0 ≤ 值 < 180，
+   从 +x 轴逆时针计），点击「等面积分段」；结果按段着色并标注段号，
+   段列表显示每段实际面积 / 目标面积 / 偏差与投影范围，点击可高亮定位，
+   「下载分段 GeoJSON」保存结果；修改任一输入会自动清除旧分段。
+8. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
 
 ## API
 
@@ -234,6 +263,63 @@ python -m tests.test_api
 `relation` 取值固定为
 `disjoint` / `touch` / `overlap` / `within` / `contains` / `equals`，
 列表按 `feature_index` 升序。`forbidden` 为空时返回空数组。
+
+### `POST /api/subdivide`
+
+请求体在 `/api/clip` 的基础上增加两个字段（GeoJSON 校验规则完全一致）：
+
+```json
+{
+  "parcel": { "type": "Polygon", "coordinates": [...] },
+  "forbidden": { "type": "FeatureCollection", "features": [ ... ] },
+  "count": 4,
+  "angle_deg": 0
+}
+```
+
+- `count`：分段数量，**整数 2~12**（整数值浮点如 `3.0` 也可接受）
+- `angle_deg`：方向角（度），**有限数值且 0 ≤ 值 < 180**，从 +x 轴逆时针计
+
+成功响应（HTTP 200，`ok=true`）：
+
+```json
+{
+  "ok": true,
+  "count": 4,
+  "angle_deg": 0,
+  "direction": [1.0, 0.0],
+  "areas": { "parcel_area": 9600.0, "forbidden_union_area": 0.0,
+             "removed_area": 0.0, "remaining_area": 9600.0 },
+  "total_area": 9600.0,
+  "target_area": 2400.0,
+  "area_tolerance": 9.6e-05,
+  "cuts": [30.0, 60.0, 90.0],
+  "segments": [
+    {
+      "segment": 1,
+      "area_m2": 2400.0,
+      "target_area_m2": 2400.0,
+      "area_error_m2": 0.0,
+      "projection_range": [0.0, 30.0],
+      "part_count": 1
+    }
+  ],
+  "feature_count": 4,
+  "result": { "type": "FeatureCollection", "features": [ ... ] },
+  "issues": []
+}
+```
+
+- `cuts`：count−1 条切线的**投影值**（递增），切线即投影等值线
+- `segments`：每段的**实际面积**（`area_m2`）与**目标面积**
+  （`target_area_m2` = `total_area / count`）、偏差、投影范围与独立面数
+- `result`：分段 GeoJSON，每段一个 Feature（保留独立面与孔洞，
+  properties 含段号与面积信息），按投影递增编号
+- `area_tolerance` = `max(1e-6, total_area × 1e-8)`，每段偏差不超过它
+
+失败响应（HTTP 200，`ok=false`，不输出分段）：参数非法（count / angle_deg
+越界或非有限数）、输入几何无效（`issues` 定位）、地块要素数不唯一、
+可建范围被完全扣除等。缺少 `count` / `angle_deg` 字段时返回 HTTP 422。
 
 ## 说明与限制
 

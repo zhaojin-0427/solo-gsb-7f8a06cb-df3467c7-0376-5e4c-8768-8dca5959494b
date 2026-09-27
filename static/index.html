@@ -12,7 +12,8 @@
     <p class="subtitle">
       坐标按<strong>平面米制</strong>解释 · 合并禁建区后从地块扣除 ·
       共点共边不扣面积、重叠禁建区只算一次 ·
-      支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）
+      支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）·
+      支持<strong>等面积分段</strong>（按方向角用平行切线等分可建范围）
     </p>
   </header>
 
@@ -41,6 +42,25 @@
         <button type="button" id="btn-clip" class="btn btn-primary">校验并裁切</button>
         <button type="button" id="btn-relations" class="btn">关系审计</button>
       </div>
+
+      <div class="field subdivide-box">
+        <div class="field-head">
+          <label>等面积分段（先扣禁建区，再等分可建范围）</label>
+        </div>
+        <div class="subdivide-controls">
+          <label class="subdivide-item">数量（2~12）
+            <input type="number" id="subdivide-count" min="2" max="12" step="1" value="3" />
+          </label>
+          <label class="subdivide-item">角度（度，0 ≤ 值 &lt; 180）
+            <input type="number" id="subdivide-angle" min="0" max="179.999" step="any" value="0" />
+          </label>
+          <button type="button" id="btn-subdivide" class="btn btn-primary">等面积分段</button>
+        </div>
+        <p class="subdivide-hint">
+          方向：从 +x 轴逆时针旋转指定角度，用垂直于该方向的平行切线按累计面积等分，
+          按投影递增编号；修改任一输入会清除旧分段。
+        </p>
+      </div>
       <div id="status" class="status" role="status"></div>
     </section>
 
@@ -53,6 +73,8 @@
             <input type="checkbox" id="show-forbidden" checked /></label>
           <label class="toggle"><span class="swatch swatch-result"></span>裁切结果
             <input type="checkbox" id="show-result" checked /></label>
+          <label class="toggle"><span class="swatch swatch-segments"></span>分段
+            <input type="checkbox" id="show-segments" checked /></label>
         </div>
         <div class="map-actions">
           <button type="button" class="btn btn-small" id="btn-zoom-in">＋</button>
@@ -98,6 +120,18 @@
         ，点击列表条目可在地图上高亮对应禁建区。
       </p>
       <ul id="relation-list"></ul>
+    </section>
+
+    <section class="panel segments-panel" id="segments-panel" hidden>
+      <h2>等面积分段（<span id="segment-count">0</span> 段）</h2>
+      <p class="segments-summary" id="segments-summary"></p>
+      <ul id="segment-list"></ul>
+      <div class="result-actions">
+        <button type="button" id="btn-download-subdivide" class="btn btn-primary">
+          下载分段 GeoJSON
+        </button>
+        <button type="button" id="btn-view-subdivide-json" class="btn">查看分段 JSON</button>
+      </div>
     </section>
 
     <section class="panel json-panel" id="json-panel" hidden>

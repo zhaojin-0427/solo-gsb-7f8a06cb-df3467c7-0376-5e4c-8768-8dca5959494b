@@ -401,6 +401,168 @@ check("rel: MP 双内含 within", row["relation"] == "within"
 # ---------- 24. 无禁建区：空审计 ----------
 check("rel: 空列表", audit_relations(precs, []) == [])
 
+# ---------- 25. 等面积分段：基本切分 ----------
+from app.geometry_ops import SubdivideError, subdivide_parcel, subdivide_area_tolerance
+from shapely import union_all
+
+sq100 = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]]},
+    "parcel",
+)
+
+# 25.1 正方形 4 段、方向角 0：切线垂直于 +x，即 x = 25/50/75
+r = subdivide_parcel(sq100, [], 4, 0.0)
+check("sub: 切线 x=25/50/75", r["cuts"] == [25.0, 50.0, 75.0], str(r["cuts"]))
+check("sub: 4 段", len(r["segments"]) == 4 and len(r["cuts"]) == 3)
+check("sub: 总面积 10000", r["total_area"] == 10000.0 and r["target_area"] == 2500.0)
+check("sub: 容差 max(1e-6, 1e-4)", abs(r["area_tolerance"] - 1e-4) < 1e-15)
+check(
+    "sub: 各段面积恰为目标",
+    all(s["area"] == 2500.0 for s in r["segments"]),
+    str([s["area"] for s in r["segments"]]),
+)
+# 段 1 是最左侧（投影最小）的条带
+seg1 = r["segments"][0]["geom"]
+check("sub: 段1投影递增编号", seg1.bounds[0] == 0.0 and seg1.bounds[2] == 25.0, str(seg1.bounds))
+
+# 25.2 方向角 90：投影 = y，水平切带
+r = subdivide_parcel(sq100, [], 4, 90.0)
+check("sub: 90° 切线 y=25/50/75",
+      all(abs(c - e) < 1e-9 for c, e in zip(r["cuts"], [25.0, 50.0, 75.0])), str(r["cuts"]))
+seg1 = r["segments"][0]["geom"]
+check("sub: 90° 段1在底部", seg1.bounds[1] < 1e-9 and abs(seg1.bounds[3] - 25.0) < 1e-9)
+
+# 25.3 任意角度（45°）面积也在容差内
+r = subdivide_parcel(sq100, [], 3, 45.0)
+check("sub: 45° 面积容差",
+      all(abs(s["area"] - 10000 / 3) <= r["area_tolerance"] for s in r["segments"]),
+      str([s["area"] for s in r["segments"]]))
+
+# 25.4 容差定义
+check("sub: 容差函数", subdivide_area_tolerance(50.0) == 1e-6
+      and subdivide_area_tolerance(1e8) == 1.0)
+
+# ---------- 26. 等面积分段：合并覆盖与两两不交 ----------
+for ang in (0.0, 30.0, 45.0, 90.0, 120.5, 179.9):
+    r = subdivide_parcel(sq100, [], 5, ang)
+    geoms = [s["geom"] for s in r["segments"]]
+    sym = union_all(geoms).symmetric_difference(union_all(sq100)).area
+    check(f"sub: {ang}° 合并覆盖原范围", sym < 1e-9, f"symdiff={sym}")
+    ok_disjoint = all(
+        geoms[i].intersection(geoms[j]).area == 0.0
+        for i in range(len(geoms))
+        for j in range(i + 1, len(geoms))
+    )
+    check(f"sub: {ang}° 两两交集面积为0", ok_disjoint)
+    check(f"sub: {ang}° 面积容差",
+          all(abs(s["area"] - 2000.0) <= r["area_tolerance"] for s in r["segments"]))
+
+# ---------- 27. 等面积分段：空隙取较小投影端 ----------
+two_squares = expect_valid(
+    {"type": "MultiPolygon", "coordinates": [
+        [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+        [[[20, 0], [30, 0], [30, 10], [20, 10], [20, 0]]],
+    ]},
+    "parcel",
+)
+# 目标 100 = 左正方形面积，累计面积在空隙 [10, 20] 上恒等于目标 → 取 10
+r = subdivide_parcel(two_squares, [], 2, 0.0)
+check("sub: 空隙切线取较小端 10", r["cuts"] == [10.0], str(r["cuts"]))
+check("sub: 空隙两段各 100",
+      abs(r["segments"][0]["area"] - 100.0) < 1e-9
+      and abs(r["segments"][1]["area"] - 100.0) < 1e-9)
+check("sub: 段1是左正方形", r["segments"][0]["geom"].bounds == (0.0, 0.0, 10.0, 10.0))
+
+# ---------- 28. 等面积分段：禁建区扣除 + 孔洞保留 ----------
+hole = expect_valid(
+    {"type": "Polygon", "coordinates": [[[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]]]},
+    "forbidden",
+)
+r = subdivide_parcel(sq100, hole, 3, 0.0)
+check("sub: 先扣禁建区 9600", abs(r["total_area"] - 9600.0) < 1e-9)
+check("sub: 扣孔后各段 3200",
+      all(abs(s["area"] - 3200.0) <= r["area_tolerance"] for s in r["segments"]),
+      str([s["area"] for s in r["segments"]]))
+mid = r["segments"][1]["geom"]
+mid_polys = [mid] if mid.geom_type == "Polygon" else list(mid.geoms)
+check("sub: 中段保留孔洞", sum(len(p.interiors) for p in mid_polys) == 1)
+
+# 禁建区把地块切成两半时，段内保留多个独立面
+bar = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 40], [100, 40], [100, 60], [0, 60], [0, 40]]]},
+    "forbidden",
+)
+r = subdivide_parcel(sq100, bar, 2, 0.0)
+check("sub: 可建 8000 两段各 4000",
+      all(abs(s["area"] - 4000.0) <= r["area_tolerance"] for s in r["segments"]))
+check("sub: 段含多个独立面",
+      any(s["part_count"] == 2 for s in r["segments"]),
+      str([s["part_count"] for s in r["segments"]]))
+# 合并后仍覆盖可建范围
+buildable = union_all(sq100).difference(union_all(bar))
+sym = union_all([s["geom"] for s in r["segments"]]).symmetric_difference(buildable).area
+check("sub: 扣除后合并覆盖可建范围", sym < 1e-9, f"symdiff={sym}")
+
+# ---------- 29. 等面积分段：三角形解析解 ----------
+tri = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [100, 0], [0, 100], [0, 0]]]},
+    "parcel",
+)
+r = subdivide_parcel(tri, [], 2, 0.0)
+# 理论切线 x* = 100·(1 − 1/√2)
+check("sub: 三角形切线解析解",
+      abs(r["cuts"][0] - 100 * (1 - 2 ** -0.5)) < 1e-6, str(r["cuts"]))
+check("sub: 三角形两段各 2500",
+      all(abs(s["area"] - 2500.0) <= r["area_tolerance"] for s in r["segments"]))
+
+# ---------- 30. 等面积分段：count 上限 ----------
+r = subdivide_parcel(sq100, [], 12, 60.0)
+check("sub: count=12", len(r["segments"]) == 12 and len(r["cuts"]) == 11)
+check("sub: count=12 面积容差",
+      all(abs(s["area"] - 10000 / 12) <= r["area_tolerance"] for s in r["segments"]))
+
+# ---------- 31. 等面积分段：大面积相对容差 ----------
+big = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [10000, 0], [10000, 10000], [0, 10000], [0, 0]]]},
+    "parcel",
+)
+r = subdivide_parcel(big, [], 7, 45.0)
+check("sub: 大面积容差 = 总面积×1e-8", r["area_tolerance"] == 1.0)
+check("sub: 大面积各段容差内",
+      all(abs(s["area"] - 1e8 / 7) <= r["area_tolerance"] for s in r["segments"]),
+      str(max(abs(s["area"] - 1e8 / 7) for s in r["segments"])))
+
+# ---------- 32. 等面积分段：错误情形 ----------
+cover_all = expect_valid(
+    {"type": "Polygon", "coordinates": [[[-1, -1], [101, -1], [101, 101], [-1, 101], [-1, -1]]]},
+    "forbidden",
+)
+try:
+    subdivide_parcel(sq100, cover_all, 2, 0.0)
+    check("sub: 扣空报错", False)
+except SubdivideError as exc:
+    check("sub: 扣空报错", "扣除" in str(exc), str(exc))
+
+for bad_count in (0, 1, 13, 100):
+    try:
+        subdivide_parcel(sq100, [], bad_count, 0.0)
+        check(f"sub: count={bad_count} 拒绝", False)
+    except SubdivideError:
+        check(f"sub: count={bad_count} 拒绝", True)
+
+for bad_angle in (-0.1, 180.0, 270.0, float("nan"), float("inf")):
+    try:
+        subdivide_parcel(sq100, [], 2, bad_angle)
+        check(f"sub: angle={bad_angle} 拒绝", False)
+    except SubdivideError:
+        check(f"sub: angle={bad_angle} 拒绝", True)
+
+# 边界角度合法
+r = subdivide_parcel(sq100, [], 2, 0.0)
+check("sub: angle=0 合法", len(r["segments"]) == 2)
+r = subdivide_parcel(sq100, [], 2, 179.999)
+check("sub: angle<180 合法", len(r["segments"]) == 2)
+
 print()
 if failures:
     print(f"{len(failures)} 个失败: {failures}")

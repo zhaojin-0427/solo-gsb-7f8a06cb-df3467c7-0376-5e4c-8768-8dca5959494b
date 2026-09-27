@@ -1,10 +1,12 @@
-"""GeoJSON 输入校验与地块裁切核心逻辑（平面米制坐标）。
+"""GeoJSON 输入校验、地块裁切与等面积分段核心逻辑（平面米制坐标）。
 
 设计要点：
 - 坐标一律按平面米制解释，面积单位为平方米。
 - 未闭合环 / 自交 / 零面积等问题必须精确定位（环序、坐标点、坐标值）。
 - 禁建区先做并集再裁切：重叠部分只算一次；共点、共边不产生扣减
   （Shapely 的差集本身只扣正面积，天然满足该要求）。
+- 等面积分段：先求可建范围，再按方向角用垂直平行切线等分，
+  切线位置由累计面积反求（顶点投影事件 + 二分），不做等宽切带或栅格近似。
 """
 
 from __future__ import annotations
@@ -622,6 +624,20 @@ def _as_polygons(geom: BaseGeometry) -> list[Polygon]:
     return []
 
 
+def _linear_length(geom: BaseGeometry) -> float:
+    """几何中全部线状成分的总长度（点 / 空 / 面状成分计 0）。"""
+    if geom.is_empty:
+        return 0.0
+    gtype = geom.geom_type
+    if gtype in ("LineString", "LinearRing"):
+        return float(geom.length)
+    if gtype == "MultiLineString":
+        return float(geom.length)
+    if gtype == "GeometryCollection":
+        return sum(_linear_length(g) for g in geom.geoms)
+    return 0.0
+
+
 def clip_parcel(
     parcel_geoms: list[Polygon | MultiPolygon],
     forbidden_geoms: list[Polygon | MultiPolygon],
@@ -737,3 +753,227 @@ def audit_relations(
 
     rows.sort(key=lambda r: r["feature_index"])
     return rows
+
+
+# ---------------------------------------------------------------------------
+# 等面积分段
+# ---------------------------------------------------------------------------
+
+# 分段数量允许范围
+SUBDIVIDE_MIN_COUNT = 2
+SUBDIVIDE_MAX_COUNT = 12
+# 每段面积与目标面积（可建总面积 / count）允许的最大偏差：
+# max(1e-6 平方米, 总面积 × 1e-8)
+SUBDIVIDE_ABS_TOL = 1e-6
+SUBDIVIDE_REL_TOL = 1e-8
+
+
+class SubdivideError(Exception):
+    """等面积分段的前置条件不满足（如可建范围为空、参数越界）。"""
+
+
+def subdivide_area_tolerance(total_area: float) -> float:
+    """每段面积允许的最大偏差：max(1e-6 平方米, 总面积 × 1e-8)。"""
+    return max(SUBDIVIDE_ABS_TOL, total_area * SUBDIVIDE_REL_TOL)
+
+
+def _iter_rings(geom: BaseGeometry):
+    """遍历 Polygon / MultiPolygon 的全部坐标环（外环与孔洞环）。"""
+    if isinstance(geom, Polygon):
+        yield geom.exterior
+        yield from geom.interiors
+    elif isinstance(geom, MultiPolygon):
+        for poly in geom.geoms:
+            yield from _iter_rings(poly)
+
+
+def subdivide_parcel(
+    parcel_geoms: list[Polygon | MultiPolygon],
+    forbidden_geoms: list[Polygon | MultiPolygon],
+    count: int,
+    angle_deg: float,
+) -> dict:
+    """先扣除禁建区得到可建范围，再按方向角做等面积分段。
+
+    - 方向：从 +x 轴逆时针旋转 angle_deg 度的单位向量 u；
+    - 切线：垂直于 u 的平行线，即投影 p = x·ux + y·uy 的等值线；
+    - 分段：按投影递增编号，第 k 条切线由累计面积 k·总面积/count 反求
+      （顶点投影事件区间内累计面积是二次函数，解析求根，异常时二分兜底；
+      禁止等宽切带 / 栅格近似）；
+    - 累计面积在空隙上恰等于目标时，取空隙的较小投影端；
+    - 每段面积与目标面积的偏差 ≤ max(1e-6 平方米, 总面积 × 1e-8)。
+    """
+    if not (SUBDIVIDE_MIN_COUNT <= count <= SUBDIVIDE_MAX_COUNT):
+        raise SubdivideError(
+            f"分段数量必须是 {SUBDIVIDE_MIN_COUNT}~{SUBDIVIDE_MAX_COUNT} 的整数"
+        )
+    if not math.isfinite(angle_deg) or not (0.0 <= angle_deg < 180.0):
+        raise SubdivideError("方向角必须是有限数值，且满足 0 ≤ angle_deg < 180")
+
+    # 先计算可建范围（复用裁切：禁建区并集差集）
+    clip = clip_parcel(parcel_geoms, forbidden_geoms)
+    parts = clip["parts"]
+    if not parts:
+        raise SubdivideError("地块被禁建区完全扣除，可建范围为 0，无法进行等面积分段")
+    region = parts[0] if len(parts) == 1 else union_all(parts)
+    total = float(region.area)
+    if total <= 0.0:
+        raise SubdivideError("可建范围面积为 0，无法进行等面积分段")
+
+    theta = math.radians(angle_deg)
+    ux, uy = math.cos(theta), math.sin(theta)
+    vx, vy = -uy, ux  # u 逆时针 90°，与 u 构成 (投影, 垂直) 正交坐标系
+
+    # 全部顶点在 u 方向上的投影：累计面积函数 A(t) 在每个相邻投影对之间
+    # 是二次光滑段，顶点投影即反求切线所需的全部“事件点”。
+    projections: list[float] = []
+    perpendiculars: list[float] = []
+    for ring in _iter_rings(region):
+        for x, y in ring.coords:
+            projections.append(x * ux + y * uy)
+            perpendiculars.append(x * vx + y * vy)
+    events = sorted(set(projections))
+    pmin, pmax = events[0], events[-1]
+    qmin, qmax = min(perpendiculars), max(perpendiculars)
+
+    span_p = pmax - pmin
+    span_q = qmax - qmin
+    pad = max(span_p, span_q, 1.0)  # 切带矩形外扩量，保证完整覆盖可建范围
+    q_lo, q_hi = qmin - pad, qmax + pad
+
+    def slab(t_lo: float, t_hi: float) -> Polygon:
+        """(投影, 垂直) 坐标系下的矩形 [t_lo, t_hi] × [q_lo, q_hi]。"""
+        return Polygon(
+            [
+                (t_lo * ux + q_lo * vx, t_lo * uy + q_lo * vy),
+                (t_lo * ux + q_hi * vx, t_lo * uy + q_hi * vy),
+                (t_hi * ux + q_hi * vx, t_hi * uy + q_hi * vy),
+                (t_hi * ux + q_lo * vx, t_hi * uy + q_lo * vy),
+            ]
+        )
+
+    def area_upto(t: float) -> float:
+        """累计面积 A(t)：可建范围中投影 ≤ t 部分的面积。"""
+        return float(region.intersection(slab(pmin - pad, t)).area)
+
+    def section_width(t: float) -> float:
+        """截面宽度 w(t)：可建范围与投影等值线 p = t 的交集总长度。"""
+        line = LineString(
+            [
+                (t * ux + q_lo * vx, t * uy + q_lo * vy),
+                (t * ux + q_hi * vx, t * uy + q_hi * vy),
+            ]
+        )
+        cross = region.intersection(line)
+        return float(_linear_length(cross))
+
+    tol = subdivide_area_tolerance(total)
+    # “恰等于”判定容差：远小于分段容差，只用于识别落在空隙上的目标
+    eq_eps = max(1e-9, total * 1e-12)
+
+    # 每个事件点的累计面积，用于定位目标所在区间并识别空隙平台
+    event_areas = [area_upto(e) for e in events]
+    for i in range(1, len(event_areas)):  # 数值上强制非递减
+        if event_areas[i] < event_areas[i - 1]:
+            event_areas[i] = event_areas[i - 1]
+
+    width_bound = span_q  # 截面宽度上界：dA/dt ≤ 垂直方向跨度
+
+    def invert_bisect(lo: float, hi: float, target: float) -> float:
+        """二分反求（兜底）：保证 |A(t) - target| ≤ tol / 4。"""
+        for _ in range(200):
+            if (hi - lo) * width_bound <= tol * 0.25:
+                break
+            mid = 0.5 * (lo + hi)
+            if area_upto(mid) >= target:
+                hi = mid
+            else:
+                lo = mid
+        return 0.5 * (lo + hi)
+
+    def invert(lo: float, hi: float, target: float) -> float:
+        """在 (lo, hi) 内按累计面积反求切线投影（禁止等宽切带 / 栅格近似）。
+
+        相邻事件点之间没有顶点投影，截面宽度 w 是 t 的线性函数，
+        累计面积 A 是 t 的二次函数：在区间内部取两个截面宽度样本即可
+        精确还原该二次函数并解析求根；数值异常时退化为二分。
+        （端点处 w 可能因与边界共线而跳变，故样本必须取在开区间内部。）
+        """
+        h = hi - lo
+        area_lo = area_upto(lo)
+        delta = target - area_lo
+        t1, t2 = lo + h / 3.0, lo + 2.0 * h / 3.0
+        w1, w2 = section_width(t1), section_width(t2)
+        slope = (w2 - w1) / (t2 - t1)  # w(t) = w0 + slope·(t - lo)
+        w0 = w1 - slope * (t1 - lo)
+
+        cut = None
+        if abs(slope) <= 1e-15 * max(1.0, abs(w0)):
+            if w0 > 0.0:
+                cut = lo + delta / w0
+        else:
+            # (slope/2)·s² + w0·s - delta = 0，取落在 (lo, hi) 内的根
+            disc = w0 * w0 + 2.0 * slope * delta
+            if disc >= 0.0:
+                root = math.sqrt(disc)
+                for cand in ((-w0 + root) / slope, (-w0 - root) / slope):
+                    if 0.0 < cand < h:
+                        cut = lo + cand
+                        break
+        if cut is not None and abs(area_upto(cut) - target) <= tol * 0.125:
+            return cut
+        return invert_bisect(lo, hi, target)
+
+    cuts: list[float] = []
+    for k in range(1, count):
+        target = total * k / count
+        cut = None
+        for i, a in enumerate(event_areas):
+            if abs(a - target) <= eq_eps:
+                # 累计面积在空隙上恰等于目标：取空隙的较小投影端。
+                # 事件升序遍历，首次命中即累计面积首次达到目标的位置。
+                cut = events[i]
+                break
+            if a > target:
+                cut = invert(events[i - 1], events[i], target)
+                break
+        if cut is None:  # pragma: no cover - target < total 时必然命中
+            cut = events[-1]
+        cuts.append(cut)
+
+    # 用相邻切线围成的切带裁出各段：相邻段只共享切线（零面积），
+    # 全部切带铺满投影范围，合并后恰好覆盖原可建范围。
+    bounds = [pmin - pad, *cuts, pmax + pad]
+    segments: list[dict] = []
+    for k in range(count):
+        seg = region.intersection(slab(bounds[k], bounds[k + 1]))
+        seg_polys = [p for p in _as_polygons(seg) if p.area > 0.0]
+        if not seg_polys:  # pragma: no cover - 每段面积 ≈ 总面积/count > 0
+            raise SubdivideError(f"第 {k + 1} 段为空，无法完成等面积分段")
+        geom_out = seg_polys[0] if len(seg_polys) == 1 else union_all(seg_polys)
+        area = float(sum(p.area for p in seg_polys))
+        segments.append(
+            {
+                "segment": k + 1,
+                "geom": geom_out,
+                "area": area,
+                "target": total / count,
+                "part_count": len(seg_polys),
+                "projection_range": [
+                    cuts[k - 1] if k > 0 else pmin,
+                    cuts[k] if k < count - 1 else pmax,
+                ],
+            }
+        )
+
+    return {
+        "segments": segments,
+        "cuts": cuts,
+        "count": count,
+        "angle_deg": angle_deg,
+        "direction": [ux, uy],
+        "total_area": total,
+        "target_area": total / count,
+        "area_tolerance": tol,
+        "areas": clip["areas"],
+    }

@@ -28,7 +28,15 @@ const LAYERS = {
     stroke: "#1c8a4f",
     width: 2,
   },
+  segments: { show: true }, // 分段按段着色，颜色取自 SEGMENT_COLORS
 };
+
+// 等面积分段的调色板（最多 12 段，与分段数量上限一致）
+const SEGMENT_COLORS = [
+  "#1f6feb", "#1c8a4f", "#d9a83b", "#7e4fd1",
+  "#d64545", "#0e8a9e", "#c2571a", "#5b7f2b",
+  "#b03a8c", "#4a5bd0", "#8a6d3b", "#2c8c7a",
+];
 
 // 当前画布上的数据
 const view = {
@@ -40,6 +48,8 @@ const view = {
   activeIssue: -1,
   relations: [],
   activeRelation: -1, // 高亮的禁建区要素索引
+  segments: [], // [{polys, info}] 等面积分段结果，按下标即段号-1
+  activeSegment: -1, // 高亮的段下标
 };
 
 // 六类关系的展示文案与描边色（与列表徽章配色一致）
@@ -328,8 +338,65 @@ function draw() {
   if (LAYERS.parcel.show) drawLayer(view.parcelPolys, "parcel");
   if (LAYERS.forbidden.show) drawForbidden();
   if (LAYERS.result.show) drawLayer(view.resultPolys, "result");
+  if (LAYERS.segments.show) drawSegments();
 
   drawIssueMarkers();
+}
+
+/** #rrggbb → 带透明度的 rgba 字符串 */
+function hexA(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function polyCentroid(poly) {
+  // 用外环顶点均值作为标注位置（对分段结果的展示足够稳定）
+  let sx = 0, sy = 0;
+  const n = poly.outer.length;
+  for (const [x, y] of poly.outer) { sx += x; sy += y; }
+  return n ? [sx / n, sy / n] : null;
+}
+
+/** 画等面积分段：每段独立着色，段号标注在最大面中心。 */
+function drawSegments() {
+  const hasActive = view.activeSegment >= 0;
+  view.segments.forEach((seg, i) => {
+    const color = SEGMENT_COLORS[i % SEGMENT_COLORS.length];
+    const isActive = hasActive && i === view.activeSegment;
+    if (hasActive && !isActive) {
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+    }
+    for (const poly of seg.polys) {
+      const path = polygonPath(poly);
+      ctx.fillStyle = hexA(color, isActive ? 0.5 : 0.32);
+      ctx.fill(path, "evenodd");
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isActive ? 3.5 : 2;
+      ctx.stroke(path);
+    }
+    if (hasActive && !isActive) ctx.restore();
+
+    // 段号标注：取该段顶点最多的面
+    let main = null;
+    for (const poly of seg.polys) {
+      if (!main || poly.outer.length > main.outer.length) main = poly;
+    }
+    const c = main && polyCentroid(main);
+    if (c) {
+      const [sx, sy] = toScreen(c[0], c[1]);
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.strokeText(`段 ${i + 1}`, sx, sy);
+      ctx.fillStyle = color;
+      ctx.fillText(`段 ${i + 1}`, sx, sy);
+    }
+  });
 }
 
 function drawIssueMarkers() {
@@ -404,6 +471,7 @@ function currentBounds() {
   let b = boundsOf(view.parcelPolys);
   b = mergeBounds(b, boundsOf(view.forbiddenPolys));
   b = mergeBounds(b, boundsOf(view.resultPolys));
+  for (const seg of view.segments) b = mergeBounds(b, boundsOf(seg.polys));
   return b;
 }
 
@@ -411,6 +479,7 @@ for (const [key, id] of [
   ["parcel", "show-parcel"],
   ["forbidden", "show-forbidden"],
   ["result", "show-result"],
+  ["segments", "show-segments"],
 ]) {
   $(id).addEventListener("change", (e) => {
     LAYERS[key].show = e.target.checked;
@@ -508,6 +577,7 @@ function focusIssue(i) {
 // ---------------------------------------------------------------------------
 
 let lastResultGeoJSON = null;
+let lastSubdivideGeoJSON = null;
 
 /** 清除关系审计结果与高亮（重新预览 / 裁切 / 输入变更时调用）。 */
 function resetRelations() {
@@ -516,6 +586,22 @@ function resetRelations() {
   $("relations-panel").hidden = true;
   $("relation-list").innerHTML = "";
   $("relation-count").textContent = "0";
+}
+
+/** 清除等面积分段结果（输入变更或执行其他动作时调用）。 */
+function clearSubdivision() {
+  view.segments = [];
+  view.activeSegment = -1;
+  lastSubdivideGeoJSON = null;
+  $("segments-panel").hidden = true;
+  $("segment-list").innerHTML = "";
+  $("segment-count").textContent = "0";
+  draw();
+}
+
+// 任一输入（地块 / 禁建区 / 数量 / 角度）改变时清除旧分段
+for (const el of [parcelInput, forbiddenInput, $("subdivide-count"), $("subdivide-angle")]) {
+  el.addEventListener("input", clearSubdivision);
 }
 
 function readInputs() {
@@ -546,6 +632,7 @@ function previewInputs() {
   renderStats(null);
   renderIssues([]);
   resetRelations();
+  clearSubdivision();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -581,6 +668,7 @@ async function runClip() {
   renderStats(null);
   renderIssues([]);
   resetRelations();
+  clearSubdivision();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -736,6 +824,7 @@ async function runRelations() {
   renderStats(null);
   renderIssues([]);
   resetRelations();
+  clearSubdivision();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -793,6 +882,186 @@ async function runRelations() {
 }
 
 $("btn-relations").addEventListener("click", runRelations);
+
+// ---------------------------------------------------------------------------
+// 等面积分段
+// ---------------------------------------------------------------------------
+
+function fmtNum(x, digits = 6) {
+  if (x == null || Number.isNaN(x)) return "—";
+  return Number(x).toLocaleString("zh-CN", { maximumFractionDigits: digits });
+}
+
+function renderSegments(data) {
+  const panel = $("segments-panel");
+  const list = $("segment-list");
+  list.innerHTML = "";
+  panel.hidden = false;
+  $("segment-count").textContent = data.count;
+
+  const cuts = data.cuts.map((c) => fmtNum(c)).join("，");
+  $("segments-summary").textContent =
+    `可建总面积 ${fmtArea(data.total_area)} · 每段目标 ${fmtArea(data.target_area)}` +
+    `（容差 ±${fmtNum(data.area_tolerance)} m²）· 方向角 ${fmtNum(data.angle_deg)}°` +
+    ` · 切线投影值：${cuts}`;
+
+  data.segments.forEach((info, i) => {
+    const color = SEGMENT_COLORS[i % SEGMENT_COLORS.length];
+    const li = document.createElement("li");
+    li.style.borderLeftColor = color;
+    li.dataset.index = i;
+
+    const title = document.createElement("div");
+    title.className = "segment-title";
+    const sw = document.createElement("span");
+    sw.className = "segment-swatch";
+    sw.style.background = color;
+    const name = document.createElement("span");
+    name.textContent = `段 ${info.segment}`;
+    const parts = document.createElement("span");
+    parts.className = "relation-name";
+    parts.textContent = info.part_count > 1 ? `${info.part_count} 个独立面` : "";
+    title.appendChild(sw);
+    title.appendChild(name);
+    title.appendChild(parts);
+
+    const metrics = document.createElement("div");
+    metrics.className = "segment-metrics";
+    const err = info.area_error_m2;
+    metrics.textContent =
+      `面积 ${fmtArea(info.area_m2)} · 目标 ${fmtArea(info.target_area_m2)}` +
+      ` · 偏差 ${err >= 0 ? "+" : ""}${fmtNum(err)} m²` +
+      ` · 投影 [${fmtNum(info.projection_range[0])}, ${fmtNum(info.projection_range[1])}]`;
+
+    li.appendChild(title);
+    li.appendChild(metrics);
+    li.addEventListener("click", () => focusSegment(i));
+    list.appendChild(li);
+  });
+  draw();
+}
+
+function focusSegment(i) {
+  view.activeSegment = i;
+  document.querySelectorAll("#segment-list li").forEach((li) => {
+    li.classList.toggle("active", Number(li.dataset.index) === i);
+  });
+  if (!LAYERS.segments.show) {
+    LAYERS.segments.show = true;
+    $("show-segments").checked = true;
+  }
+  const seg = view.segments[i];
+  const b = seg && boundsOf(seg.polys);
+  if (b) {
+    const pad = Math.max(
+      8,
+      (worldBounds
+        ? Math.max(worldBounds[2] - worldBounds[0], worldBounds[3] - worldBounds[1]) * 0.04
+        : 20)
+    );
+    fitTo([b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad]);
+  } else {
+    draw();
+  }
+}
+
+async function runSubdivide() {
+  $("json-panel").hidden = true;
+  renderStats(null);
+  renderIssues([]);
+  resetRelations();
+  clearSubdivision();
+  lastResultGeoJSON = null;
+  $("btn-download").disabled = true;
+  $("btn-view-json").disabled = true;
+  view.resultPolys = [];
+
+  let payload;
+  try {
+    const { parcel, forbidden } = readInputs();
+    const count = Number($("subdivide-count").value);
+    const angle = Number($("subdivide-angle").value);
+    if (!Number.isInteger(count) || count < 2 || count > 12) {
+      throw new Error("分段数量必须是 2~12 的整数");
+    }
+    if (!Number.isFinite(angle) || angle < 0 || angle >= 180) {
+      throw new Error("方向角必须是有限数值，且满足 0 ≤ 角度 < 180");
+    }
+    payload = { parcel, forbidden, count, angle_deg: angle };
+  } catch (e) {
+    setStatus(e.message, "error");
+    return;
+  }
+
+  try {
+    setPreviewLayers(payload);
+  } catch {
+    /* 预览失败不影响请求 */
+  }
+
+  setStatus("正在校验并按累计面积等分…");
+  try {
+    const resp = await fetch("/api/subdivide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+
+    if (!data.ok) {
+      renderIssues(data.issues);
+      fitTo(mergeBounds(currentBounds(), issueBounds(view.issues)) || currentBounds());
+      setStatus(
+        data.error + `（共 ${data.issues ? data.issues.length : 0} 个问题，点击列表可定位）`,
+        "error"
+      );
+      return;
+    }
+
+    lastSubdivideGeoJSON = data.result;
+    view.segments = (data.result.features || []).map((f) => ({
+      polys: extractPolygons([f.geometry]),
+      info: f.properties || {},
+    }));
+    view.activeSegment = -1;
+    renderStats(data.areas);
+    renderIssues([]);
+    renderSegments(data);
+    fitTo(currentBounds());
+    setStatus(
+      `分段完成：可建面积 ${fmtArea(data.total_area)} 等分为 ${data.count} 段，` +
+        `每段目标 ${fmtArea(data.target_area)}（容差 ±${fmtNum(data.area_tolerance)} m²），` +
+        `点击段列表可高亮`,
+      "ok"
+    );
+  } catch (e) {
+    setStatus(`请求失败：${e.message}`, "error");
+  }
+}
+
+$("btn-subdivide").addEventListener("click", runSubdivide);
+
+$("btn-download-subdivide").addEventListener("click", () => {
+  if (!lastSubdivideGeoJSON || lastSubdivideGeoJSON.features.length === 0) return;
+  const blob = new Blob([JSON.stringify(lastSubdivideGeoJSON, null, 2)], {
+    type: "application/geo+json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  a.href = url;
+  a.download = `subdivide-result-${ts}.geojson`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+$("btn-view-subdivide-json").addEventListener("click", () => {
+  if (!lastSubdivideGeoJSON) return;
+  const panel = $("json-panel");
+  panel.hidden = !panel.hidden;
+  $("json-view").textContent = JSON.stringify(lastSubdivideGeoJSON, null, 2);
+  if (!panel.hidden) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
 
 $("btn-download").addEventListener("click", () => {
   if (!lastResultGeoJSON || lastResultGeoJSON.features.length === 0) return;
