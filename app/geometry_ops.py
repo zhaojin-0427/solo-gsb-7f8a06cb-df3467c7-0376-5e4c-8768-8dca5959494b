@@ -30,6 +30,10 @@ RELATION_AREA_EPS = ZERO_AREA_EPS
 # 坐标点去重 / 近点归属的容差
 COORD_EPS = 1e-9
 
+# 等面积分段：每段面积相对「总面积 / count」允许的绝对 / 相对误差
+SUBDIVIDE_ABS_EPS = 1e-6
+SUBDIVIDE_REL_EPS = 1e-8
+
 # 禁建区相对地块的六类空间关系（DE-9IM 归类，顺序即页面展示顺序）
 RELATIONS = ("disjoint", "touch", "overlap", "within", "contains", "equals")
 
@@ -737,3 +741,227 @@ def audit_relations(
 
     rows.sort(key=lambda r: r["feature_index"])
     return rows
+
+
+# ---------------------------------------------------------------------------
+# 等面积分段
+# ---------------------------------------------------------------------------
+#
+# 语义：
+# - 先求「可建范围」R = 地块 - 全部禁建区并集（与裁切同一套逻辑）。
+# - 方向 u = (cos θ, sin θ)，θ 为相对 +x 轴逆时针转过的角度 angle_deg。
+# - 切割线与 u 垂直：{p : u·p = t}。R 在 u 上的投影记 s = u·p。
+# - 累计面积 F(t) = area(R ∩ {u·p ≤ t}) 关于 t 单调不减；投影空隙（无几何
+#   覆盖的投影区间）对应 F 的水平台阶段。
+# - 对每个目标累计面积 k·A/count，用二分在 F 上反求 t；严禁等宽切带或栅格
+#   近似。目标值恰好落在台阶段（空隙）上时，取台阶段的较小投影端。
+# - 段 k = R ∩ {t_{k-1} < u·p ≤ t_k}（t_0=投影最小端，t_count=投影最大端），
+#   按投影递增编号；各段保留实际的独立面与孔洞，合并后恰好覆盖 R，
+#   两两交集面积为 0。
+
+
+def _iter_polygon_rings(geom: BaseGeometry):
+    """枚举几何中全部 Polygon 的 (外环, 孔洞环...) 坐标环。"""
+    polys = _as_polygons(geom)
+    for poly in polys:
+        yield list(poly.exterior.coords), [list(h.coords) for h in poly.interiors]
+
+
+def _projection_bounds_and_events(
+    geom: BaseGeometry, ux: float, uy: float
+) -> tuple[float, float, list[float]]:
+    """收集几何在 u 方向上的投影范围与全部顶点投影（候选事件点）。"""
+    smin, smax = math.inf, -math.inf
+    events: list[float] = []
+    for outer, holes in _iter_polygon_rings(geom):
+        for ring in (outer, *holes):
+            for x, y, *_ in ring:
+                s = x * ux + y * uy
+                events.append(s)
+                if s < smin:
+                    smin = s
+                if s > smax:
+                    smax = s
+    return smin, smax, events
+
+
+def _half_plane(
+    u: tuple[float, float], t: float, a_back: float, v_low: float, v_high: float
+) -> Polygon:
+    """半平面 {p = a·u + b·v : a_back ≤ a ≤ t, v_low ≤ b ≤ v_high}。
+
+    u 为分段方向，v 为与 u 垂直的切割线方向；a、b 均是真实长度（米）。
+    a_back 取几何 u 投影范围之外，v_low/v_high 取几何 v 投影范围之外，故对
+    被切几何而言与无限半平面 {u·p ≤ t} 等价，但坐标量级保持在几何本身附近，
+    避免超大坐标引发 GEOS 精度问题。
+    """
+    ux, uy = u
+    vx, vy = -uy, ux  # u 顺时针转 90°，即切割线方向
+    return Polygon(
+        [
+            (t * ux + v_low * vx, t * uy + v_low * vy),
+            (t * ux + v_high * vx, t * uy + v_high * vy),
+            (a_back * ux + v_high * vx, a_back * uy + v_high * vy),
+            (a_back * ux + v_low * vx, a_back * uy + v_low * vy),
+        ]
+    )
+
+
+def _slab(
+    u: tuple[float, float],
+    t0: float,
+    t1: float,
+    v_low: float,
+    v_high: float,
+) -> Polygon:
+    """带状区域 {p = a·u + b·v : t0 ≤ a ≤ t1, v_low ≤ b ≤ v_high}。"""
+    ux, uy = u
+    vx, vy = -uy, ux
+    return Polygon(
+        [
+            (t0 * ux + v_low * vx, t0 * uy + v_low * vy),
+            (t0 * ux + v_high * vx, t0 * uy + v_high * vy),
+            (t1 * ux + v_high * vx, t1 * uy + v_high * vy),
+            (t1 * ux + v_low * vx, t1 * uy + v_low * vy),
+        ]
+    )
+
+
+def _invert_cumulative_area(
+    target: float,
+    cum_area,
+    events: list[float],
+    lo: float,
+    hi: float,
+    area_eps: float,
+    proj_eps: float,
+) -> float:
+    """反求使 F(t) ≥ target 成立的最小 t（F 为单调不减的累计面积函数）。
+
+    先用二分（唯一允许的求切方式：基于真实累计面积，不是等宽 / 栅格近似）
+    逼近；若某个顶点投影事件点上的累计面积已等于 target，则取满足条件的
+    最小事件点 —— 这正是「目标落在投影空隙台阶段时取较小投影端」的规则。
+    """
+    # 台阶段优先：在数值容差内，target 可能恰在某个顶点事件处被首次达到。
+    eligible = sorted(
+        {e for e in events if abs(cum_area(e) - target) <= area_eps and lo <= e <= hi}
+    )
+    if eligible:
+        return eligible[0]
+
+    # 常规二分：F(lo)=0 < target，F(hi)=A ≥ target，找最小的 t 使 F(t) ≥ target
+    for _ in range(200):
+        mid = (lo + hi) * 0.5
+        if cum_area(mid) >= target:
+            hi = mid
+        else:
+            lo = mid
+    t = hi
+
+    # 二分结果落在台阶内时，依旧把它吸附到台阶的较小端（事件点）。
+    near = sorted({e for e in events if abs(e - t) <= proj_eps})
+    for e in near:  # 已按升序，取第一个累计面积达标的事件点
+        if cum_area(e) >= target - area_eps:
+            return e
+    return t
+
+
+def subdivide_buildable(
+    buildable: BaseGeometry,
+    count: int,
+    angle_deg: float,
+) -> dict:
+    """把可建范围按方向 angle_deg 等面积分成 count 段。
+
+    返回每段 Polygon 列表、切线投影、目标 / 实际面积与方向信息。
+    buildable 必须是正面积的 Polygon / MultiPolygon（调用方负责先扣空检查）。
+    """
+    theta = math.radians(angle_deg)
+    ux, uy = math.cos(theta), math.sin(theta)
+    u = (ux, uy)
+
+    total_area = float(buildable.area)
+    target_area = total_area / count
+    area_tol = max(SUBDIVIDE_ABS_EPS, total_area * SUBDIVIDE_REL_EPS)
+
+    smin, smax, events = _projection_bounds_and_events(buildable, ux, uy)
+    span = smax - smin
+    if not (span > 0.0):
+        raise GeoJSONError("可建范围在分段方向上没有正投影宽度，无法分段")
+    # 垂直方向（切割线方向 v）上的投影范围
+    vmin, vmax, _ = _projection_bounds_and_events(buildable, -uy, ux)
+    # 半平面 / 切带向外延伸的余量，确保完整覆盖几何且坐标量级适中
+    margin = max(span, vmax - vmin) * 2.0 + 1.0
+    a_back = smin - margin
+    v_low = vmin - margin
+    v_high = vmax + margin
+
+    def cum_area(t: float) -> float:
+        return float(
+            buildable.intersection(_half_plane(u, t, a_back, v_low, v_high)).area
+        )
+
+    proj_eps = max(span * 1e-10, 1e-12)
+
+    cuts: list[float] = []
+    for k in range(1, count):
+        t = _invert_cumulative_area(
+            target_area * k,
+            cum_area,
+            events,
+            smin,
+            smax,
+            area_tol,
+            proj_eps,
+        )
+        cuts.append(t)
+
+    # 累计面积目标严格递增，反求出的切线投影也必须严格递增
+    for prev, t in zip([smin, *cuts], cuts):
+        if not t > prev:
+            raise GeoJSONError(
+                f"切线投影 {t:.9g} 未严格递增（前一边界 {prev:.9g}），无法分段"
+            )
+
+    boundaries = [smin, *cuts, smax]
+    segment_polys: list[list[Polygon]] = []
+    actual_areas: list[float] = []
+    for k in range(count):
+        band = _slab(u, boundaries[k], boundaries[k + 1], v_low, v_high)
+        piece = buildable.intersection(band)
+        polys = [p for p in _as_polygons(piece) if p.area > 0.0]
+        a = float(sum(p.area for p in polys))
+        if abs(a - target_area) > area_tol:
+            raise GeoJSONError(
+                f"第 {k + 1} 段面积 {a:.9g} 与目标 {target_area:.9g} 的偏差超出容差"
+            )
+        segment_polys.append(polys)
+        actual_areas.append(a)
+
+    # 几何复核：合并后必须覆盖原范围，两两交集面积必须为 0
+    all_pieces = [p for polys in segment_polys for p in polys]
+    union_pieces = union_all(all_pieces)
+    coverage_gap = float(buildable.difference(union_pieces).area)
+    overflow = float(union_pieces.difference(buildable).area)
+    if coverage_gap > area_tol or overflow > area_tol:
+        raise GeoJSONError(
+            f"分段未能完整覆盖可建范围（缺口 {coverage_gap:.6g}、越界 {overflow:.6g} 平方米）"
+        )
+    for i in range(len(all_pieces)):
+        for j in range(i + 1, len(all_pieces)):
+            if float(all_pieces[i].intersection(all_pieces[j]).area) > area_tol:
+                raise GeoJSONError("分段之间存在正面积重叠")
+
+    return {
+        "count": count,
+        "angle_deg": float(angle_deg),
+        "direction": [ux, uy],
+        "buildable_area": total_area,
+        "target_area": target_area,
+        "area_tolerance": area_tol,
+        "projection_min": float(smin),
+        "projection_max": float(smax),
+        "cuts": [float(t) for t in cuts],
+        "segments": segment_polys,
+        "actual_areas": actual_areas,
+    }

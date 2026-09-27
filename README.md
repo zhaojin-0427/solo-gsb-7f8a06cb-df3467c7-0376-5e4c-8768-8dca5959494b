@@ -4,7 +4,9 @@
 （`Polygon` / `MultiPolygon`），先做严格几何校验与错误定位，再把全部禁建区
 **合并（并集）后从地块中扣除**，预览输入与结果、显示剩余面积，并下载结果
 GeoJSON。同时提供**禁建区关系审计**：逐要素判定禁建区相对地块的空间关系
-（相离 / 共点共边 / 部分重叠 / 完全位于地块内 / 包含地块 / 完全一致）。
+（相离 / 共点共边 / 部分重叠 / 完全位于地块内 / 包含地块 / 完全一致），以及
+**等面积分段**：先扣禁建区得到可建范围，再按指定方向用平行切线反求切点，
+把可建范围分成面积相等的 `count` 段。
 
 - 后端：Python 3.11 + FastAPI + Shapely 2（GEOS）
 - 前端：原生 HTML / CSS / JavaScript（Canvas 渲染，**零第三方依赖**）
@@ -64,13 +66,42 @@ FeatureCollection 原始下标作为稳定索引，无效要素跳过、不影�
 结果按 `feature_index` 升序排列。页面「关系审计」列出全部结果并按关系着色，
 点击任一条目即在地图上高亮对应禁建区（其余要素变暗、自动缩放定位）。
 
+### 等面积分段（`POST /api/subdivide`）
+
+请求体在 `/api/clip` 的 `parcel` / `forbidden` 之外，另收两个参数：
+
+- `count`：**整数**，分段数量，取值 **2～12**（不接受布尔、浮点、字符串）。
+- `angle_deg`：有限数字，分段方向角（度），**0 ≤ 值 < 180**，方向为从
+  **+x 轴逆时针**转过该角度的单位向量 `u`。
+
+算法与保证：
+
+1. 先计算**可建范围**（地块扣除禁建区并集，语义与裁切完全一致）。
+2. 切割线与 `u` 垂直（方程 `u·p = t`），几何在 `u` 上的投影记为 `s = u·p`。
+   按累计面积 `F(t) = area(可建范围 ∩ {u·p ≤ t})` 对每个目标
+   `k × 总面积 / count` **二分反求**切线投影 `t`——不是等宽切带，也不做
+   栅格近似。
+3. 投影方向上若存在**空隙**（如两块分离的面之间没有几何），`F(t)` 会出现
+   水平台阶；当目标累计面积恰落在台阶上时，切线取**空隙的较小投影端**。
+4. 段 `k = 可建范围 ∩ {tₖ₋₁ < u·p ≤ tₖ}`，按投影递增从 1 编号；每段保留
+   实际的**独立面与孔洞**（一段可含多个 Polygon，输出为 `MultiPolygon`）。
+5. 每段面积与 `总面积 / count` 的差不超过
+   `max(1e-6 平方米, 总面积 × 1e-8)`；各段合并后恰好覆盖原可建范围，
+   两两交集面积为 0（仅允许共享切割线，零面积）。
+6. 可建范围被完全扣空、参数非法或输入几何无效时一律报错，**不输出分段**。
+
+页面在「等面积分段」区填写**段数**与**角度**后点击「等面积分段」：各段按
+12 色调色盘着色，橙色虚线为反求出的平行切线，列表逐段给出实际 / 目标面积
+与差值，点击任一段可缩放定位；可「下载分段 GeoJSON」。**修改数量、角度或
+任一输入文本都会立即清除旧分段**，避免结果与输入不一致。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/health、静态页面托管
+│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/subdivide、/api/health、静态页面托管
 │   └── geometry_ops.py    # GeoJSON 解析、错误定位、并集差集裁切、关系审计
 ├── static/
 │   ├── index.html         # 页面结构
@@ -138,7 +169,12 @@ python -m tests.test_api
 5. 裁切成功后查看剩余面积与结果图层（绿色），点击「下载结果 GeoJSON」保存；
    扣空时返回空要素集合且不提供下载。
 6. 关系审计后点击关系列表条目可高亮对应禁建区，再点「校验并裁切」可随时回到裁切。
-7. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
+7. **等面积分段**：在左侧「等面积分段」区填写段数（2～12 整数）与方向角
+   （0 ≤ 值 < 180，自 +x 轴逆时针），点击「等面积分段」。成功后各段按不同
+   颜色绘制，橙色虚线为反求出的平行切线；下方列表逐段显示实际 / 目标面积
+   与偏差，点击某段自动缩放定位，「下载分段 GeoJSON」保存全部段。
+   修改段数、角度或地块 / 禁建区输入都会立即清除旧分段。
+8. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
 
 ## API
 
@@ -234,6 +270,78 @@ python -m tests.test_api
 `relation` 取值固定为
 `disjoint` / `touch` / `overlap` / `within` / `contains` / `equals`，
 列表按 `feature_index` 升序。`forbidden` 为空时返回空数组。
+
+### `POST /api/subdivide`
+
+请求（`parcel` / `forbidden` 与 `/api/clip` 完全相同，另加 `count`、
+`angle_deg`）：
+
+```json
+{
+  "parcel": { "type": "Polygon", "coordinates": [...] },
+  "forbidden": { "type": "FeatureCollection", "features": [ ... ] },
+  "count": 4,
+  "angle_deg": 0
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "count": 4,
+  "angle_deg": 0,
+  "direction": { "ux": 1.0, "uy": 0.0 },
+  "areas": {
+    "parcel_area": 10000.0,
+    "forbidden_union_area": 400.0,
+    "removed_area": 400.0,
+    "buildable_area": 9600.0
+  },
+  "target_area_m2": 2400.0,
+  "area_tolerance_m2": 0.000096,
+  "projection": { "min": 0.0, "max": 100.0 },
+  "cuts": [
+    { "index": 1, "projection": 24.0 },
+    { "index": 2, "projection": 50.0 },
+    { "index": 3, "projection": 76.0 }
+  ],
+  "segments": [
+    {
+      "segment": 1,
+      "projection_low": 0.0,
+      "projection_high": 24.0,
+      "actual_area_m2": 2400.0,
+      "target_area_m2": 2400.0,
+      "area_error_m2": 0.0
+    }
+  ],
+  "feature_count": 4,
+  "result": { "type": "FeatureCollection", "features": [ ... ] },
+  "issues": []
+}
+```
+
+字段说明：
+
+- `cuts`：`count - 1` 条内部切线，`projection` 即切线 `u·p = t` 中的 `t`
+  （投影值，单位米），按投影递增给出；`projection.min/max` 是可建范围在
+  `u` 上的投影端点，分别作为第 1 段下界与第 `count` 段上界。
+- `direction`：由 `angle_deg` 得到的单位方向向量。
+- `segments`：逐段给出投影区间、**实际面积** `actual_area_m2` 与
+  **目标面积** `target_area_m2` 及二者之差 `area_error_m2`。
+- `result`：分段 GeoJSON，每个 Feature 对应一段（`properties.segment` 为
+  段号，含实际 / 目标面积），几何在该段包含多个独立面时为 `MultiPolygon`，
+  孔洞照常保留。
+
+错误响应：
+
+- 参数非法（`count` 非 2～12 的整数、`angle_deg` 越界 / 非有限数 / 类型错误、
+  缺字段等）：HTTP **422**，`ok=false`，无 `result` / `cuts`。
+- 几何无效：与其它接口相同的 `ok=false` + `issues` 定位结构（HTTP 200）。
+- 可建范围为空（地块被禁建区完全扣除）：`ok=false`，错误信息提示无法分段，
+  不返回任何分段。
 
 ## 说明与限制
 

@@ -401,6 +401,132 @@ check("rel: MP 双内含 within", row["relation"] == "within"
 # ---------- 24. 无禁建区：空审计 ----------
 check("rel: 空列表", audit_relations(precs, []) == [])
 
+# ---------- 25. 等面积分段 ----------
+from shapely.geometry import box as _box, shape as _shape
+from shapely.ops import unary_union as _unary_union
+from app.geometry_ops import subdivide_buildable
+
+SUB_FAILS = []
+
+
+def sub_check(name, cond, detail=""):
+    check(name, cond, detail)
+    if not cond:
+        SUB_FAILS.append(name)
+
+
+def _flatten(geom):
+    return [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
+
+
+def _verify_subdivision(buildable, count, angle, tol_mult=1.0):
+    """通用验证：面积等权、覆盖、两两零面积交集、孔洞/独立面保留。"""
+    res = subdivide_buildable(buildable, count, angle)
+    target = buildable.area / count
+    tol = max(1e-6, buildable.area * 1e-8) * tol_mult
+
+    sub_check(f"sub[{angle}°/{count}]: 返回段数", len(res["segments"]) == count)
+    # 切线按投影递增
+    sub_check(
+        f"sub[{angle}°/{count}]: 切线递增",
+        all(a < b for a, b in zip(res["cuts"], res["cuts"][1:])),
+        str(res["cuts"]),
+    )
+
+    all_pieces = []
+    for k, polys in enumerate(res["segments"]):
+        sub_check(f"sub[{angle}°/{count}]: 第{k+1}段非空", len(polys) >= 1)
+        a = sum(p.area for p in polys)
+        sub_check(
+            f"sub[{angle}°/{count}]: 第{k+1}段等面积",
+            abs(a - target) <= tol,
+            f"{a} vs {target}",
+        )
+        all_pieces.extend(polys)
+
+    union_pieces = _unary_union(all_pieces)
+    symdiff = float(buildable.symmetric_difference(union_pieces).area)
+    # 覆盖差只来自 GEOS 浮点噪声（典型 1e-12～1e-28），用独立的几何容差判断
+    cover_tol = max(1e-7, buildable.area * 1e-11)
+    sub_check(
+        f"sub[{angle}°/{count}]: 覆盖原范围",
+        symdiff <= cover_tol,
+        f"symdiff={symdiff}",
+    )
+    worst = 0.0
+    for i in range(len(all_pieces)):
+        for j in range(i + 1, len(all_pieces)):
+            worst = max(worst, all_pieces[i].intersection(all_pieces[j]).area)
+    sub_check(f"sub[{angle}°/{count}]: 两两交集面积0", worst <= tol, f"worst={worst}")
+    return res
+
+
+# 25.1 矩形 + 各种角度与段数
+square = _box(0, 0, 100, 100)
+for angle in [0, 15, 44.999, 45, 90, 135, 179.999]:
+    _verify_subdivision(square, 5, angle)
+for n in (2, 3, 7, 12):
+    _verify_subdivision(square, n, 30)
+
+# 25.2 投影空隙：两个分离方块 [0,10]² 与 [20,30]×[0,10]，x 方向
+disconnected = _unary_union([_box(0, 0, 10, 10), _box(20, 0, 30, 10)])
+res = _verify_subdivision(disconnected, 2, 0)
+# 目标累计 100 恰落在空隙台阶段 [10,20] -> 取较小投影端 10
+sub_check("sub 空隙: 取较小投影端10", res["cuts"] == [10.0], str(res["cuts"]))
+# count=4：每段 50，切线投影 5 / 10 / 25；
+# 目标累计 100 落空隙台阶 [10,20] 取较小端 10；目标 150 落在第二块内为 25
+res = _verify_subdivision(disconnected, 4, 0)
+sub_check("sub 空隙: 多切线取台阶端", res["cuts"] == [5.0, 10.0, 25.0], str(res["cuts"]))
+sub_check("sub 空隙: 投影范围", res["projection_min"] == 0.0 and res["projection_max"] == 30.0)
+# 各段实际面积全部 50
+sub_check("sub 空隙: 四段等面积",
+          all(abs(a - 50.0) < 1e-7 for a in res["actual_areas"]), str(res["actual_areas"]))
+
+# 25.3 孔洞保留：切割线穿过孔洞时，孔洞被分到相邻段中
+holy = _box(0, 0, 100, 100).difference(_box(40, 40, 60, 60))
+res = _verify_subdivision(holy, 4, 0)
+# 面积上每段 2400（含孔洞扣减），且扣减总面积仍为 400
+sub_check("sub 孔洞: 各段2400",
+          all(abs(a - 2400.0) < 1e-6 for a in res["actual_areas"]), str(res["actual_areas"]))
+total_seg_area = sum(res["actual_areas"])
+sub_check("sub 孔洞: 总面积9600", abs(total_seg_area - 9600.0) < 1e-6)
+# 纵向切（90°）count=3：切线 33.33/66.67，孔洞 y∈[40,60] 完整落在中间段内
+res = _verify_subdivision(holy, 3, 90)
+total_holes = sum(len(list(p.interiors)) for polys in res["segments"] for p in polys)
+sub_check("sub 孔洞: 完整孔洞保留在段内", total_holes >= 1, f"holes={total_holes}")
+# 该中间段面积为 3200（含 400 的孔洞扣减）
+mid_area = res["actual_areas"][1]
+sub_check("sub 孔洞: 中间段面积3200", abs(mid_area - 3200.0) < 1e-6, str(mid_area))
+# 切在孔洞边（x=40 与 x=60）：count=12 的切线含 40/60
+res = _verify_subdivision(holy, 12, 0)
+sub_check("sub 孔洞: 切线贴孔边40/60",
+          any(abs(c - 40.0) < 1e-7 for c in res["cuts"])
+          and any(abs(c - 60.0) < 1e-7 for c in res["cuts"]),
+          str(res["cuts"]))
+
+# 25.4 多个独立面（横条被挖掉）切割后段内保留多个独立面
+striped = _box(0, 0, 100, 100).difference(_box(0, 40, 100, 60))
+res = _verify_subdivision(striped, 4, 90)
+# y 方向 4 段等面积（每段 2000）：投影区间 0~25 / 25~50 / 50~75 / 75~100，
+# 仅第二段（25～50）同时穿过上下两块
+multi_segments = [polys for polys in res["segments"] if len(polys) >= 2]
+sub_check("sub 独立面: 跨空隙段含两个独立面", len(multi_segments) == 1,
+          str([len(polys) for polys in res["segments"]]))
+
+# 25.5 非轴对齐多边形（平行四边形），方向 0 等分
+para = _shape({"type": "Polygon", "coordinates": [
+    [[0, 0], [100, 0], [140, 60], [40, 60], [0, 0]]]})
+_ = _verify_subdivision(para, 6, 0)
+# 该形状带三角形端部，截面宽度随 x 非线性，等面积切线不应等距（证明不是等宽切带）
+res = subdivide_buildable(para, 6, 0)
+gaps = [b - a for a, b in zip([res["projection_min"], *res["cuts"]],
+                              [*res["cuts"], res["projection_max"]])]
+sub_check("sub 平行四边形: 非等宽切带", max(gaps) - min(gaps) > 1e-4, str(gaps))
+
+# 25.6 分段方向向量随角度变化
+res = subdivide_buildable(square, 3, 90)
+sub_check("sub 方向: 90度", abs(res["direction"][0]) < 1e-12 and abs(res["direction"][1] - 1) < 1e-12)
+
 print()
 if failures:
     print(f"{len(failures)} 个失败: {failures}")

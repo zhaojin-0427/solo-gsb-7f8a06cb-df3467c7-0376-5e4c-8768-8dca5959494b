@@ -13,7 +13,24 @@
   --forbidden-stroke: #d64545;
   --result-fill: rgba(34, 160, 100, 0.28);
   --result-stroke: #1c8a4f;
+  --segments-fill: rgba(124, 77, 224, 0.24);
+  --segments-stroke: #7c4de0;
+  --cuts-stroke: #e8830c;
 }
+
+/* 等面积分段的 12 段配色（HSL 均匀取色，count ≤ 12 可直接按下标取用） */
+.seg-color-0  { --seg-fill: rgba(230, 87, 87, 0.30);  --seg-stroke: #d64545; }
+.seg-color-1  { --seg-fill: rgba(230, 138, 60, 0.30); --seg-stroke: #d17a2c; }
+.seg-color-2  { --seg-fill: rgba(224, 184, 51, 0.30); --seg-stroke: #c39a17; }
+.seg-color-3  { --seg-fill: rgba(150, 201, 61, 0.30); --seg-stroke: #7fa323; }
+.seg-color-4  { --seg-fill: rgba(74, 194, 107, 0.30);  --seg-stroke: #2e9e55; }
+.seg-color-5  { --seg-fill: rgba(51, 196, 168, 0.30);  --seg-stroke: #1f9a82; }
+.seg-color-6  { --seg-fill: rgba(63, 178, 214, 0.30);  --seg-stroke: #2389ab; }
+.seg-color-7  { --seg-fill: rgba(71, 135, 224, 0.30);  --seg-stroke: #2f6fd6; }
+.seg-color-8  { --seg-fill: rgba(96, 92, 222, 0.30);   --seg-stroke: #4c48d1; }
+.seg-color-9  { --seg-fill: rgba(151, 84, 217, 0.30);  --seg-stroke: #7e44c9; }
+.seg-color-10 { --seg-fill: rgba(209, 82, 193, 0.30);  --seg-stroke: #b43ca3; }
+.seg-color-11 { --seg-fill: rgba(214, 88, 143, 0.30);  --seg-stroke: #c0457e; }
 
 * { box-sizing: border-box; }
 
@@ -180,6 +197,73 @@ textarea:focus { outline: 2px solid rgba(31, 111, 235, 0.35); border-color: var(
 .stat-value { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .result-actions { margin-top: 2px; }
+
+/* ---- 等面积分段 ---- */
+.swatch-segments { background: var(--segments-fill); border-color: var(--segments-stroke); }
+.swatch-cuts { background: #fff; border-color: var(--cuts-stroke); border-style: dashed; }
+
+.subdivide-box {
+  border: 1px solid #c9d6e8;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f7faff;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.subdivide-title { font-size: 13px; font-weight: 700; color: var(--primary-dark); }
+.subdivide-row { display: flex; flex-direction: column; gap: 4px; }
+.subdivide-row label { font-size: 12px; color: var(--muted); }
+.subdivide-row input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 14px;
+  background: #fff;
+}
+.subdivide-row input:focus {
+  outline: 2px solid rgba(31, 111, 235, 0.35);
+  border-color: var(--primary);
+}
+.subdivide-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.subdivide-hint { font-size: 11px; color: var(--muted); }
+
+.segments-box {
+  border: 1px solid #d8c9f0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #faf8fe;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.segments-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.segments-summary { font-size: 12px; color: var(--muted); }
+#segment-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 6px;
+}
+#segment-list li {
+  border: 1px solid var(--border);
+  border-left-width: 5px;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: pointer;
+}
+#segment-list li:hover { background: #f6f2fd; }
+#segment-list li.active { background: #f0e9fc; }
+.segment-title { font-weight: 700; display: flex; align-items: center; gap: 6px; }
+.segment-metrics { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* ---- 问题列表 ---- */
 .issues-panel { grid-column: 1 / -1; border-color: #f0c2c2; }

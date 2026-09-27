@@ -12,7 +12,8 @@
     <p class="subtitle">
       坐标按<strong>平面米制</strong>解释 · 合并禁建区后从地块扣除 ·
       共点共边不扣面积、重叠禁建区只算一次 ·
-      支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）
+      支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）·
+      支持<strong>等面积分段</strong>（POST /api/subdivide）
     </p>
   </header>
 
@@ -41,6 +42,23 @@
         <button type="button" id="btn-clip" class="btn btn-primary">校验并裁切</button>
         <button type="button" id="btn-relations" class="btn">关系审计</button>
       </div>
+
+      <div class="subdivide-box">
+        <div class="subdivide-title">等面积分段</div>
+        <div class="subdivide-row">
+          <label for="sub-count">段数 <strong>count</strong>（2～12 整数）</label>
+          <input type="number" id="sub-count" min="2" max="12" step="1" value="4" />
+        </div>
+        <div class="subdivide-row">
+          <label for="sub-angle">方向角 <strong>angle_deg</strong>（0 ≤ 值 &lt; 180，自 +x 轴逆时针）</label>
+          <input type="number" id="sub-angle" min="0" max="179.999" step="1" value="0" />
+        </div>
+        <div class="subdivide-actions">
+          <button type="button" id="btn-subdivide" class="btn btn-primary">等面积分段</button>
+          <span class="subdivide-hint">先扣禁建区，再按累计面积反求平行切线（非等宽切带）</span>
+        </div>
+      </div>
+
       <div id="status" class="status" role="status"></div>
     </section>
 
@@ -53,6 +71,10 @@
             <input type="checkbox" id="show-forbidden" checked /></label>
           <label class="toggle"><span class="swatch swatch-result"></span>裁切结果
             <input type="checkbox" id="show-result" checked /></label>
+          <label class="toggle"><span class="swatch swatch-segments"></span>等面积分段
+            <input type="checkbox" id="show-segments" checked /></label>
+          <label class="toggle"><span class="swatch swatch-cuts"></span>切线
+            <input type="checkbox" id="show-cuts" checked /></label>
         </div>
         <div class="map-actions">
           <button type="button" class="btn btn-small" id="btn-zoom-in">＋</button>
@@ -77,6 +99,20 @@
           下载结果 GeoJSON
         </button>
         <button type="button" id="btn-view-json" class="btn" disabled>查看结果 JSON</button>
+      </div>
+
+      <div class="segments-box" id="segments-box" hidden>
+        <div class="segments-head">
+          <strong>等面积分段结果</strong>
+          <span id="segments-summary" class="segments-summary"></span>
+        </div>
+        <ul id="segment-list"></ul>
+        <div class="result-actions">
+          <button type="button" id="btn-download-segments" class="btn btn-primary" disabled>
+            下载分段 GeoJSON
+          </button>
+          <button type="button" id="btn-view-segments-json" class="btn" disabled>查看分段 JSON</button>
+        </div>
       </div>
     </section>
 

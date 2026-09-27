@@ -226,6 +226,197 @@ check("relations MP 单要素", d["ok"] and d["feature_count"] == 1
       and d["relations"][0]["feature_index"] == 0
       and d["relations"][0]["relation"] == "overlap", str(d)[:300])
 
+# ============================ /api/subdivide ============================
+
+sub_parcel = {"type": "Polygon",
+              "coordinates": [[[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]]}
+
+def check_subdivision(d, count, total_area, angle=None):
+    ok = d["ok"] and d["count"] == count and d["feature_count"] == count
+    check(f"subdivide ok/count={count}", ok, str(d)[:300])
+    if not ok:
+        return
+    check(f"subdivide 段数 FC {count}", len(d["result"]["features"]) == count)
+    check(f"subdivide cuts {count-1}", len(d["cuts"]) == count - 1)
+    check(f"subdivide segments 表 {count}", len(d["segments"]) == count)
+    target = total_area / count
+    check(f"subdivide target_area={target}",
+          abs(d["target_area_m2"] - target) < 1e-6, str(d["target_area_m2"]))
+    # 切线投影严格递增
+    cuts = [c["projection"] for c in d["cuts"]]
+    check("subdivide 切线递增", all(a < b for a, b in zip(cuts, cuts[1:])), str(cuts))
+    check("subdivide 切线编号 1..", [c["index"] for c in d["cuts"]] == list(range(1, count)))
+    # 每段实际/目标面积与编号/投影区间
+    tol = max(1e-6, total_area * 1e-8)
+    bounds = [d["projection"]["min"], *cuts, d["projection"]["max"]]
+    for i, s in enumerate(d["segments"]):
+        assert s["segment"] == i + 1
+        assert abs(s["projection_low"] - bounds[i]) < 1e-9
+        assert abs(s["projection_high"] - bounds[i + 1]) < 1e-9
+        assert abs(s["actual_area_m2"] - target) <= tol, s
+        assert abs(s["target_area_m2"] - target) <= 1e-6
+    # Feature 属性齐全
+    for i, f in enumerate(d["result"]["features"]):
+        p = f["properties"]
+        assert p["segment"] == i + 1 and abs(p["area_m2"] - target) <= tol, p
+        assert f["geometry"]["type"] in ("Polygon", "MultiPolygon")
+    # 分段编号按投影递增
+    assert [s["segment"] for s in d["segments"]] == list(range(1, count + 1))
+    # 方向向量是单位向量
+    ux, uy = d["direction"]["ux"], d["direction"]["uy"]
+    assert abs(ux * ux + uy * uy - 1) < 1e-12
+    if angle is not None:
+        assert abs(d["angle_deg"] - angle) < 1e-9
+
+# 基本分段（无禁建区，正方形 10000）
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "count": 4, "angle_deg": 0})
+d = r.json()
+check_subdivision(d, 4, 10000.0, angle=0)
+check("subdivide 0度切线25/50/75",
+      [c["projection"] for c in d["cuts"]] == [25.0, 50.0, 75.0], str(d["cuts"]))
+
+# 90 度
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "count": 3, "angle_deg": 90})
+d = r.json()
+check_subdivision(d, 3, 10000.0, angle=90)
+
+# 倾斜角 37 度 + count=12（上限）
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "count": 12, "angle_deg": 37})
+d = r.json()
+check_subdivision(d, 12, 10000.0, angle=37)
+
+# 带禁建区：中心 20×20 孔洞 -> 可建 9600，先扣再分
+hole = {"type": "Polygon",
+        "coordinates": [[[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]]]}
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "forbidden": hole,
+                      "count": 4, "angle_deg": 0})
+d = r.json()
+check_subdivision(d, 4, 9600.0)
+check("subdivide 面积统计",
+      abs(d["areas"]["buildable_area"] - 9600.0) < 1e-6
+      and abs(d["areas"]["removed_area"] - 400.0) < 1e-6
+      and abs(d["areas"]["parcel_area"] - 10000.0) < 1e-6, str(d["areas"]))
+# 9600/4=2400 -> 切线 24 / 50（孔的台阶端）/ 76
+check("subdivide 孔洞台阶切线24/50/76",
+      [round(c["projection"], 6) for c in d["cuts"]] == [24.0, 50.0, 76.0],
+      str(d["cuts"]))
+
+# 投影空隙：两个分离方块，count=2，切线必须取空隙较小端 10
+gap_parcel = {"type": "MultiPolygon", "coordinates": [
+    [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+    [[[20, 0], [30, 0], [30, 10], [20, 10], [20, 0]]],
+]}
+r = client.post("/api/subdivide",
+                json={"parcel": gap_parcel, "count": 2, "angle_deg": 0})
+d = r.json()
+check_subdivision(d, 2, 200.0)
+check("subdivide 空隙取较小端10", d["cuts"][0]["projection"] == 10.0, str(d["cuts"]))
+
+# 非法参数：count 越界 / 非整数 / 布尔 / 字符串
+for bad_count in (1, 13, 0, 2.5, True, "3", None):
+    r = client.post("/api/subdivide",
+                    json={"parcel": sub_parcel, "count": bad_count, "angle_deg": 0})
+    d = r.json()
+    check(f"subdivide 非法 count={bad_count!r}",
+          r.status_code == 422 and d["ok"] is False and "result" not in d,
+          f"{r.status_code} {str(d)[:120]}")
+
+# 非法角度：180 / 负数 / 布尔 / 字符串
+for bad_angle in (180, -0.001, 180.0, True, "30", None):
+    r = client.post("/api/subdivide",
+                    json={"parcel": sub_parcel, "count": 4, "angle_deg": bad_angle})
+    d = r.json()
+    check(f"subdivide 非法 angle={bad_angle!r}",
+          r.status_code == 422 and d["ok"] is False and "result" not in d,
+          f"{r.status_code} {str(d)[:120]}")
+
+# NaN / Infinity 不是合法 JSON 数字：以原始内容发送，必须被拒绝
+for token in ("NaN", "Infinity", "-Infinity"):
+    r = client.post(
+        "/api/subdivide",
+        content=('{"parcel": %s, "count": 4, "angle_deg": %s}'
+                 % (json.dumps(sub_parcel), token)).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    check(f"subdivide 非法 angle token={token}",
+          r.status_code == 422 and r.json()["ok"] is False and "result" not in r.json(),
+          f"{r.status_code} {r.text[:120]}")
+
+# 边界合法角度 0 与 179.999
+for good_angle in (0.0, 179.999):
+    r = client.post("/api/subdivide",
+                    json={"parcel": sub_parcel, "count": 2, "angle_deg": good_angle})
+    d = r.json()
+    check(f"subdivide 边界角度 {good_angle}", d["ok"] and d["count"] == 2, str(d)[:200])
+
+# 缺字段
+r = client.post("/api/subdivide", json={"parcel": sub_parcel, "count": 4})
+check("subdivide 缺 angle 422", r.status_code == 422 and r.json()["ok"] is False)
+
+# 无效几何：与 clip/relations 同一套定位，不输出分段
+bad_geom = {"type": "FeatureCollection", "features": [
+    {"type": "Feature", "id": "p1", "geometry":
+     {"type": "Polygon", "coordinates": [[[0, 0], [2, 2], [2, 0], [0, 2]]]}},
+]}
+r = client.post("/api/subdivide",
+                json={"parcel": bad_geom, "count": 4, "angle_deg": 0})
+d = r.json()
+check("subdivide 无效几何报错", r.status_code == 200 and not d["ok"]
+      and len(d["issues"]) >= 1 and "result" not in d, str(d)[:200])
+
+# 禁建区无效
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "forbidden": bad_geom,
+                      "count": 4, "angle_deg": 0})
+d = r.json()
+check("subdivide 禁建区无效报错",
+      not d["ok"] and all(i["layer"] == "forbidden" for i in d["issues"])
+      and "result" not in d, str(d)[:200])
+
+# 完全扣空：报错且不输出分段
+cover = {"type": "Polygon",
+         "coordinates": [[[-10, -10], [110, -10], [110, 110], [-10, 110], [-10, -10]]]}
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "forbidden": cover,
+                      "count": 4, "angle_deg": 0})
+d = r.json()
+check("subdivide 扣空报错",
+      r.status_code == 200 and not d["ok"] and "可建范围为空" in d["error"]
+      and "result" not in d and "cuts" not in d, str(d)[:200])
+
+# 多地块拒绝
+r = client.post("/api/subdivide",
+                json={"parcel": two_parcels, "count": 4, "angle_deg": 0})
+d = r.json()
+check("subdivide 多地块拒绝", not d["ok"] and "恰好包含一个" in d["error"] and "result" not in d)
+
+# 结构错误 GeoJSON
+r = client.post("/api/subdivide",
+                json={"parcel": {"type": "Point", "coordinates": [1, 2]},
+                      "count": 4, "angle_deg": 0})
+d = r.json()
+check("subdivide 顶层 Point 结构错误", not d["ok"] and "结构错误" in d["error"])
+
+# 分段结果几何复核：合并覆盖原范围、两两交集面积 0、孔洞保留
+from shapely.geometry import shape as shshape
+from shapely.ops import unary_union
+r = client.post("/api/subdivide",
+                json={"parcel": sub_parcel, "forbidden": hole,
+                      "count": 5, "angle_deg": 23})
+d = r.json()
+buildable = shshape(sub_parcel).difference(shshape(hole))
+pieces = [shshape(f["geometry"]) for f in d["result"]["features"]]
+u = unary_union(pieces)
+check("subdivide HTTP 覆盖", abs(buildable.symmetric_difference(u).area) < 1e-7)
+worst = max(pieces[i].intersection(pieces[j]).area
+            for i in range(len(pieces)) for j in range(i + 1, len(pieces)))
+check("subdivide HTTP 两两零面积交集", worst < 1e-7, str(worst))
+check("subdivide HTTP 总面积", abs(sum(p.area for p in pieces) - 9600.0) < 1e-6)
+
 print()
 if fails:
     print(f"{len(fails)} 个失败: {fails}")
